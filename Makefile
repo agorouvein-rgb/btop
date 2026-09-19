@@ -194,6 +194,11 @@ else ifeq ($(PLATFORM_LC),netbsd)
 	override ADDFLAGS += -lkvm -lprop
 	export MAKE = gmake
 	SU_GROUP := wheel
+else ifeq ($(PLATFORM_LC),sunos)
+	PLATFORM_DIR := openindiana
+	THREADS := $(shell getconf NPROCESSORS_ONLN || echo 1)
+	override ADDFLAGS += -lkstat -lproc -lsocket -lnsl -static-libstdc++
+	SU_GROUP := root
 else
 $(error $(call red_i,ERROR: $(WHITE)Unsupported platform ($(PLATFORM))))
 endif
