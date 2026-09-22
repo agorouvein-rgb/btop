@@ -15,22 +15,30 @@ limitations under the License.
 indent = tab
 tab-size = 4
 */
+//? Need the structured /proc interface (psinfo_t). <procfs.h> selects it by defining _STRUCTURED_PROC 1 before
+//? including <sys/procfs.h>; if <sys/procfs.h> is seen first it gets the old ioctl-based one and psinfo_t is missing.
+//? (Previously <libproc.h> happened to pull <procfs.h> in first.) So only use <procfs.h>, and define it up front
+//? so no earlier header can pull in the wrong flavour.
+#ifndef _STRUCTURED_PROC
+#define _STRUCTURED_PROC 1
+#endif
 #include <arpa/inet.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <libproc.h>
 #include <kstat.h>
 #include <sys/loadavg.h>
 #include <sys/sysinfo.h>
 #include <sys/mnttab.h>
 #include <sys/swap.h>
-#include <sys/procfs.h>
 #include <procfs.h>
 #include <dirent.h>
-// man 3 getifaddrs: "BUGS: If	both <net/if.h>	and <ifaddrs.h>	are being included, <net/if.h> must be included before <ifaddrs.h>"
+//? getifaddrs(3C) does not exist on Solaris 10 (<ifaddrs.h> is missing), so interfaces are
+//? enumerated with the SIOCGLIFCONF ioctls instead - see list_interfaces() below.
 #include <net/if.h>
-#include <ifaddrs.h>
+#include <sys/sockio.h>
+#include <sys/ioctl.h>
+#include <cerrno>
 #include <netdb.h>
 #include <netinet/tcp_fsm.h>
 #include <netinet/in.h> // for inet_ntop stuff
@@ -41,7 +49,6 @@ tab-size = 4
 #include <sys/types.h>
 #include <sys/param.h>
 #include <vector>
-#include <paths.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -639,7 +646,8 @@ namespace Mem {
 			//? proc, mntfs, tmpfs, objfs, bootfs, sharefs, lofs, fd, autofs.
 			static const std::unordered_set<string> pseudo_fstypes = {
 				"devfs", "dev", "ctfs", "proc", "mntfs", "tmpfs",
-				"objfs", "bootfs", "sharefs", "lofs", "fd", "autofs"
+				"objfs", "bootfs", "sharefs", "lofs", "fd", "autofs",
+				"vmblock", "vmhgfs"  //? VMware Tools pseudo-filesystems (seen on a Solaris 10 guest)
 			};
 
 			vector<string> found;
@@ -751,6 +759,65 @@ namespace Mem {
 
 }  // namespace Mem
 
+//? One address of one interface, as reported by SIOCGLIFCONF.
+struct IfEntry {
+	string name;              //? Physical interface name, e.g. "e1000g0" (":1" alias suffix stripped)
+	int family = AF_UNSPEC;   //? AF_INET or AF_INET6
+	struct sockaddr_storage addr {};
+	bool running = false;     //? IFF_RUNNING
+};
+
+//? Portable replacement for getifaddrs(): works on Solaris 10 and on illumos.
+//? Returns false and sets err (an errno value) on failure. Like getifaddrs(), an interface with
+//? several addresses produces several entries, physical interface first.
+static bool list_interfaces(vector<IfEntry> &out, int &err) {
+	out.clear();
+	err = 0;
+
+	//? SIOCGLIFCONF with AF_UNSPEC lists both IPv4 and IPv6 through an AF_INET socket, but
+	//? SIOCGLIFFLAGS is answered by the stack matching the socket family, so IPv6 needs its own socket.
+	const int sock4 = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock4 < 0) { err = errno; return false; }
+	const int sock6 = socket(AF_INET6, SOCK_DGRAM, 0);  //? may fail if IPv6 is unavailable - that's fine
+
+	auto cleanup = [&]() { close(sock4); if (sock6 >= 0) close(sock6); };
+
+	struct lifnum lifn {};
+	lifn.lifn_family = AF_UNSPEC;
+	lifn.lifn_flags = 0;
+	if (ioctl(sock4, SIOCGLIFNUM, &lifn) < 0) { err = errno; cleanup(); return false; }
+
+	//? A little headroom in case an interface appears between the two ioctls
+	vector<struct lifreq> reqs((size_t)lifn.lifn_count + 4);
+	struct lifconf lifc {};
+	lifc.lifc_family = AF_UNSPEC;
+	lifc.lifc_flags = 0;
+	lifc.lifc_len = (int)(reqs.size() * sizeof(struct lifreq));
+	lifc.lifc_buf = reinterpret_cast<caddr_t>(reqs.data());
+	if (ioctl(sock4, SIOCGLIFCONF, &lifc) < 0) { err = errno; cleanup(); return false; }
+
+	const size_t count = (size_t)lifc.lifc_len / sizeof(struct lifreq);
+	for (size_t i = 0; i < count and i < reqs.size(); i++) {
+		IfEntry e;
+		e.name = reqs[i].lifr_name;
+		if (auto colon = e.name.find(':'); colon != string::npos)
+			e.name.resize(colon);
+		e.addr = reqs[i].lifr_addr;
+		e.family = e.addr.ss_family;
+
+		struct lifreq fl {};
+		strncpy(fl.lifr_name, reqs[i].lifr_name, sizeof(fl.lifr_name) - 1);
+		const int fsock = (e.family == AF_INET6 and sock6 >= 0) ? sock6 : sock4;
+		if (ioctl(fsock, SIOCGLIFFLAGS, &fl) == 0)
+			e.running = (fl.lifr_flags & IFF_RUNNING) != 0;
+
+		out.push_back(std::move(e));
+	}
+
+	cleanup();
+	return true;
+}
+
 namespace Net {
 	std::unordered_map<string, net_info> current_net;
 	net_info empty_net = {};
@@ -770,30 +837,29 @@ namespace Net {
 		auto new_timestamp = time_ms();
 
 		if (not no_update and errors < 3) {
-			//? Get interface list using getifaddrs() wrapper
-			IfAddrsPtr if_addrs {};
-			if (if_addrs.get_status() != 0) {
+			//? Get interface list (SIOCGLIFCONF; getifaddrs() is not available on Solaris 10)
+			vector<IfEntry> if_list;
+			int if_err = 0;
+			if (not list_interfaces(if_list, if_err)) {
 				errors++;
-				Logger::error("Net::collect() -> getifaddrs() failed with id {}", if_addrs.get_status());
+				Logger::error("Net::collect() -> failed to list interfaces, errno: {}", strerror(if_err));
 				redraw = true;
 				return empty_net;
 			}
-			int family = 0;
 			static_assert(INET6_ADDRSTRLEN >= INET_ADDRSTRLEN); // 46 >= 16, compile-time assurance.
 			enum { IPBUFFER_MAXSIZE = INET6_ADDRSTRLEN }; // manually using the known biggest value, guarded by the above static_assert
 			char ip[IPBUFFER_MAXSIZE];
 			interfaces.clear();
 			string ipv4, ipv6;
 
-			//? Iteration over all items in getifaddrs() list
-			for (auto *ifa = if_addrs.get(); ifa != nullptr; ifa = ifa->ifa_next) {
-				if (ifa->ifa_addr == nullptr) continue;
-				family = ifa->ifa_addr->sa_family;
-				const auto &iface = ifa->ifa_name;
+			//? Iteration over all addresses of all interfaces
+			for (const auto &ent : if_list) {
+				const int family = ent.family;
+				const auto &iface = ent.name;
 				//? Update available interfaces vector and get status of interface
 				if (not v_contains(interfaces, iface)) {
 					interfaces.push_back(iface);
-					net[iface].connected = (ifa->ifa_flags & IFF_RUNNING);
+					net[iface].connected = ent.running;
 
 					// An interface can have more than one IP of the same family associated with it,
 					// but we pick only the first one to show in the NET box.
@@ -804,8 +870,7 @@ namespace Net {
 				//? Get IPv4 address
 				if (family == AF_INET) {
 					if (net[iface].ipv4.empty()) {
-						if (nullptr != inet_ntop(family, &(reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr), ip, IPBUFFER_MAXSIZE)) {
-
+						if (nullptr != inet_ntop(family, &(reinterpret_cast<const struct sockaddr_in*>(&ent.addr)->sin_addr), ip, IPBUFFER_MAXSIZE)) {
 							net[iface].ipv4 = ip;
 						} else {
 							int errsv = errno;
@@ -816,14 +881,14 @@ namespace Net {
 				//? Get IPv6 address
 				else if (family == AF_INET6) {
 					if (net[iface].ipv6.empty()) {
-						if (nullptr != inet_ntop(family, &(reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr)->sin6_addr), ip, IPBUFFER_MAXSIZE)) {
+						if (nullptr != inet_ntop(family, &(reinterpret_cast<const struct sockaddr_in6*>(&ent.addr)->sin6_addr), ip, IPBUFFER_MAXSIZE)) {
 							net[iface].ipv6 = ip;
 						} else {
 							int errsv = errno;
 							Logger::error("Net::collect() -> Failed to convert IPv6 to string for iface {}, errno: {}", iface, strerror(errsv));
 						}
 					}
-				}  //else, ignoring family==AF_LINK (see man 3 getifaddrs)
+				}
 			}
 
 			//? illumos: per-interface byte counters via kstat, rather than BSD's
