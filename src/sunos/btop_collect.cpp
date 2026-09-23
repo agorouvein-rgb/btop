@@ -72,7 +72,10 @@ tab-size = 4
 
 using std::clamp, std::string_literals::operator""s, std::cmp_equal, std::cmp_less, std::cmp_greater;
 using std::ifstream, std::numeric_limits, std::streamsize, std::round, std::max, std::min;
-namespace fs = std::filesystem;
+//? Aliased to something other than "fs" - on native Solaris (unlike illumos) <sys/buf.h>,
+//? pulled in transitively by some of the headers above, declares its own "fs" at file scope,
+//? which collides with a plain "namespace fs = ...".
+namespace btop_fs = std::filesystem;
 namespace rng = std::ranges;
 using namespace Tools;
 
@@ -96,7 +99,7 @@ namespace Cpu {
 	string get_cpuName();
 
 	struct Sensor {
-		fs::path path;
+		btop_fs::path path;
 		string label;
 		int64_t temp = 0;
 		int64_t high = 0;
@@ -146,7 +149,7 @@ static long get_boot_time_kstat() {
 
 namespace Shared {
 
-	fs::path passwd_path;
+	btop_fs::path passwd_path;
 	uint64_t totalMem;
 	long pageSize, clkTck, coreCount, physicalCoreCount, arg_max;
 	int totalMem_len;
@@ -314,12 +317,18 @@ namespace Cpu {
 		long long global_idles = 0;
 		long long global_user = 0, global_kernel = 0, global_wait = 0;
 
-		for (long i = 0; i < Shared::coreCount; i++) {
-			char name[32];
-			snprintf(name, sizeof(name), "cpu_stat%ld", i);
-			kstat_t *ksp = kstat_lookup(kc, "cpu_stat", (int)i, name);
-			if (!ksp || kstat_read(kc, ksp, NULL) == -1) {
-				Logger::warning("Could not read kstat for cpu {}", i);
+		//? Walk the live kstat chain for "cpu_stat" kstats instead of probing instances
+		//? "cpu_stat0".."cpu_stat<coreCount-1>" by number. CPU ids are not guaranteed to be a
+		//? contiguous, zero-based range - on SPARC in particular the id comes from system
+		//? topology (e.g. a 64-CPU system reported as instances 64-127), so the old probe-by-
+		//? number approach matched nothing and silently left every core blank. core_percent and
+		//? core_old_totals/idles are still indexed 0..coreCount-1; "i" here is that array slot,
+		//? assigned in the order kstats are found, not the kernel's CPU id.
+		long i = 0;
+		for (kstat_t *ksp = kc->kc_chain; ksp != nullptr and i < Shared::coreCount; ksp = ksp->ks_next) {
+			if (strcmp(ksp->ks_module, "cpu_stat") != 0) continue;
+			if (kstat_read(kc, ksp, NULL) == -1) {
+				Logger::warning("Could not read kstat for cpu instance {}", ksp->ks_instance);
 				continue;
 			}
 			cpu_stat_t *cs = (cpu_stat_t *)ksp->ks_data;
@@ -359,7 +368,11 @@ namespace Cpu {
 				Logger::error("Cpu::collect() : {}", e.what());
 				throw std::runtime_error(fmt::format("collect() : {}", e.what()));
 			}
+
+			i++;
 		}
+		if (i < Shared::coreCount)
+			Logger::warning("Cpu::collect() -> found {} cpu_stat kstat(s), expected {}", i, Shared::coreCount);
 
 		kstat_close(kc);
 
@@ -421,7 +434,7 @@ static uint64_t get_arc_size() {
 namespace Mem {
 	bool has_swap = false;
 	vector<string> fstab;
-	fs::file_time_type fstab_time;
+	btop_fs::file_time_type fstab_time;
 	int disk_ios = 0;
 	vector<string> last_found;
 
@@ -677,7 +690,7 @@ namespace Mem {
 
 					found.push_back(mountpoint);
 					if (not disks.contains(mountpoint)) {
-						disks[mountpoint] = disk_info{fs::canonical(dev, ec), fs::path(mountpoint).filename()};
+						disks[mountpoint] = disk_info{btop_fs::canonical(dev, ec), btop_fs::path(mountpoint).filename()};
 
 						if (disks.at(mountpoint).dev.empty())
 							disks.at(mountpoint).dev = dev;
@@ -710,7 +723,7 @@ namespace Mem {
 
 			//? Get disk/partition stats
 			for (auto &[mountpoint, disk] : disks) {
-				if (std::error_code ec; not fs::exists(mountpoint, ec))
+				if (std::error_code ec; not btop_fs::exists(mountpoint, ec))
 					continue;
 				struct statvfs vfs;
 				if (statvfs(mountpoint.c_str(), &vfs) < 0) {
@@ -1041,7 +1054,7 @@ namespace Proc {
 	bool current_rev = false;
 	bool is_tree_mode;
 
-	fs::file_time_type passwd_time;
+	btop_fs::file_time_type passwd_time;
 
 	uint64_t cputimes;
 	int collapse = -1, expand = -1, toggle_children = -1, collapse_all = -1;

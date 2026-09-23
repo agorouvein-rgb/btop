@@ -196,8 +196,21 @@ else ifeq ($(PLATFORM_LC),netbsd)
 	SU_GROUP := wheel
 else ifeq ($(PLATFORM_LC),sunos)
 	PLATFORM_DIR := sunos
-	THREADS := $(shell getconf NPROCESSORS_ONLN || echo 1)
-	override ADDFLAGS += -m64 -lkstat -lsocket -lnsl -static-libgcc -static-libstdc++ -fno-stack-protector
+	#? psrinfo is always present on illumos/Solaris; getconf NPROCESSORS_ONLN has been reported as
+	#? unrecognized on at least one native Solaris configuration, silently falling back to a serial
+	#? (1-thread) build. Prefer psrinfo and only fall back to getconf if that somehow comes up empty too.
+	THREADS := $(shell psrinfo 2>/dev/null | wc -l | tr -d ' ')
+	ifeq ($(THREADS),0)
+		THREADS := $(shell getconf NPROCESSORS_ONLN 2>/dev/null || echo 1)
+	endif
+	override ADDFLAGS += -m64 -lkstat -lsocket -lnsl -static-libgcc -fno-stack-protector
+	#? -static-libstdc++ is opt-in (S10=true) rather than default: Oracle Solaris ships no static
+	#? libstdc++ at all, so forcing it broke native Solaris builds. It's genuinely needed for the
+	#? Solaris 10 cross-build (compiled on illumos, run on Solaris 10, which is missing several libc
+	#? functions s10compat.c provides), so S10=true still adds it here.
+	ifeq ($(S10),true)
+		override ADDFLAGS += -static-libstdc++
+	endif
 	#? Solaris 10's libc has no __stack_chk_guard/__stack_chk_fail, so don't probe for or enable the stack protector
 	override TESTFLAGS := $(filter-out -fstack-protector,$(TESTFLAGS))
 	SU_GROUP := root
@@ -252,9 +265,12 @@ ifdef DEBUG
 	override OPTFLAGS := -O0 -g
 endif
 
-SOURCES	:= $(sort $(shell find $(SRCDIR) -maxdepth 1 -type f -name *.$(SRCEXT)))
+#? $(wildcard) is a GNU Make builtin, not a call out to the system find(1) - sidesteps
+#? portability differences in find flags (e.g. -maxdepth is a GNU extension some
+#? platforms' native find, including Solaris's, does not support).
+SOURCES	:= $(sort $(wildcard $(SRCDIR)/*.$(SRCEXT)))
 
-SOURCES += $(sort $(shell find $(SRCDIR)/$(PLATFORM_DIR) -maxdepth 1 -type f -name *.$(SRCEXT)))
+SOURCES += $(sort $(wildcard $(SRCDIR)/$(PLATFORM_DIR)/*.$(SRCEXT)))
 
 OBJECTS	:= $(patsubst $(SRCDIR)/%,$(BUILDDIR)/%,$(SOURCES:.$(SRCEXT)=.$(OBJEXT)))
 
