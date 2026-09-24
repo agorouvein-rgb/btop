@@ -230,8 +230,58 @@ namespace Cpu {
 	};
 
 	string get_cpuName() {
-		//? TODO: not yet ported to illumos kstat; return empty for now.
-		return "";
+		kstat_ctl_t *kc = kstat_open();
+		if (!kc) return "";
+
+		string name;
+		//? Same rationale as the cpu_stat chain-walk in Cpu::collect(): find whatever "cpu_info"
+		//? kstat actually exists rather than assuming a particular instance number is present.
+		for (kstat_t *ksp = kc->kc_chain; ksp != nullptr; ksp = ksp->ks_next) {
+			if (strcmp(ksp->ks_module, "cpu_info") != 0) continue;
+			if (kstat_read(kc, ksp, NULL) == -1) continue;
+
+			//? "brand" (x86 only) is the full CPUID brand string, e.g. "Intel(R) Core(TM)
+			//? i5-7200U CPU @ 2.50GHz". "implementation" exists on both x86 and SPARC and gives a
+			//? shorter description - used as a fallback when "brand" isn't present.
+			for (const char *field : {"brand", "implementation"}) {
+				kstat_named_t *kn = (kstat_named_t *)kstat_data_lookup(ksp, field);
+				if (kn and kn->data_type == KSTAT_DATA_STRING and kn->value.str.addr.ptr and *kn->value.str.addr.ptr) {
+					name = kn->value.str.addr.ptr;
+					break;
+				}
+			}
+			break; //? one CPU's info is enough - they're identical on any SMP illumos/Solaris box
+		}
+
+		kstat_close(kc);
+
+		//? Same cleanup upstream Linux's get_cpuName() applies for a brand-string shape it doesn't
+		//? specifically recognize: keep everything before "@" (drops a "CPU @ x.xxGHz" clock-speed
+		//? suffix, if present), strip common boilerplate words, collapse doubled spaces, trim. Used
+		//? here unconditionally rather than as a fallback: it turns e.g. "Intel(R) Core(TM)
+		//? i7-6700K CPU @ 4.00GHz" into "i7-6700K", the same short form Linux shows, without
+		//? needing Linux's Xeon/Ryzen/Intel-specific token-position matching, which is tuned to
+		//? /proc/cpuinfo's exact layout and isn't expected to generalize to illumos's kstat
+		//? "brand"/"implementation" strings (including whatever SPARC's "implementation" looks
+		//? like, untested here).
+		if (not name.empty()) {
+			auto name_vec = ssplit(name, ' ');
+			name.clear();
+			for (const auto &n : name_vec) {
+				if (n == "@") break;
+				name += n + ' ';
+			}
+			if (not name.empty()) name.pop_back();
+			//? illumos's kstat "brand" renders the trademark symbols lowercase ("(r)"/"(tm)"), unlike
+			//? Linux's /proc/cpuinfo which is always uppercase - both are stripped to be safe.
+			for (const auto *replace : {"Processor", "CPU", "(R)", "(TM)", "(r)", "(tm)", "Intel", "AMD", "Core"}) {
+				name = s_replace(name, replace, "");
+				name = s_replace(name, "  ", " ");
+			}
+			name = trim(name);
+		}
+
+		return name;
 	}
 
 	bool get_sensors() {
@@ -1123,12 +1173,34 @@ namespace Proc {
 
 		while (cmp_greater(detailed.mem_bytes.size(), width)) detailed.mem_bytes.pop_front();
 
-		// rusage_info_current rusage;
-		// if (proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, (void **)&rusage) == 0) {
-		// 	// this fails for processes we don't own - same as in Linux
-		// 	detailed.io_read = floating_humanizer(rusage.ri_diskio_bytesread);
-		// 	detailed.io_write = floating_humanizer(rusage.ri_diskio_byteswritten);
-		// }
+		//? Per-process I/O, from /proc/<pid>/usage (prusage_t, see proc(5)). This block was originally
+		//? copied from the macOS backend (proc_pid_rusage()/RUSAGE_INFO_CURRENT are Darwin APIs) and
+		//? left commented out with no illumos equivalent filled in, which is why these fields were
+		//? always empty here.
+		//?
+		//? pr_inblk/pr_oublk (block-device I/O counts) were tried first, but testing against real,
+		//? sustained raw-device I/O showed them staying at 0 throughout - this turns out to be a
+		//? long-documented Solaris/illumos quirk, not a bug here: Brendan Gregg's 2005 analysis
+		//? (brendangregg.com/Solaris/paper_diskubyp1.pdf) found they "hardly increase" regardless of
+		//? actual I/O volume, and psutil's own Solaris backend deliberately avoids them for the same
+		//? reason. pr_ioch ("chars read and written") is what's actually populated - the trade-off is
+		//? that it is a single counter covering both directions, with no read/write split available.
+		//? The combined total is shown as io_read; io_write is left empty (not "0 Byte", which would
+		//? wrongly claim a confirmed-zero write count we don't actually have) to signal that a
+		//? separate write figure isn't available on this platform, rather than implying it is zero.
+		char usage_path[32];
+		snprintf(usage_path, sizeof(usage_path), "/proc/%zu/usage", pid);
+		detailed.io_write.clear();
+		if (int usage_fd = open(usage_path, O_RDONLY); usage_fd >= 0) {
+			prusage_t pu;
+			ssize_t rd = read(usage_fd, &pu, sizeof(pu));
+			close(usage_fd);
+			//? Reading /proc/<pid>/usage can fail for processes we don't own - same caveat as on
+			//? every other platform btop supports - in which case io_read just stays empty too.
+			if (rd == (ssize_t)sizeof(pu)) {
+				detailed.io_read = floating_humanizer((uint64_t)pu.pr_ioch);
+			}
+		}
 	}
 
 	//* Collects and sorts process information from /proc
